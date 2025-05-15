@@ -6,11 +6,9 @@ import matplotlib.pyplot as plt
 import mediapipe as mp
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV2, ResNet50
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, Input, Reshape, Conv2D
-from tensorflow.keras.layers import Conv2DTranspose, LeakyReLU, Flatten, BatchNormalization
-from tensorflow.keras.models import Model, load_model, Sequential
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D, Dropout, BatchNormalization
+from tensorflow.keras.models import Model, load_model
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.utils import to_categorical, Sequence
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_recall_fscore_support
@@ -18,8 +16,6 @@ import pickle
 from tqdm import tqdm
 import random
 import gc
-import imgaug.augmenters as iaa
-from imgaug.augmenters import Sometimes, OneOf, SomeOf
 
 # Enable memory growth to avoid allocating all GPU memory at once
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -86,52 +82,161 @@ def draw_landmarks(image, results):
                 mp_drawing_styles.get_default_hand_connections_style())
     return image_copy
 
-# Advanced augmentation pipeline using imgaug
-def create_augmentation_pipeline():
-    return iaa.Sequential(
-        [
-            # Apply each augmenter with certain probability
-            Sometimes(0.5, iaa.Affine(
-                scale={"x": (0.8, 1.2), "y": (0.8, 1.2)},
-                translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)},
-                rotate=(-25, 25),
-                shear=(-8, 8)
-            )),
-            Sometimes(0.5, iaa.PerspectiveTransform(scale=(0.01, 0.1))),
-            Sometimes(0.5, iaa.ElasticTransformation(alpha=(0.5, 3.5), sigma=0.25)),
-            Sometimes(0.5, iaa.PiecewiseAffine(scale=(0.01, 0.05))),
-            OneOf([
-                iaa.GaussianBlur((0, 3.0)),
-                iaa.AverageBlur(k=(2, 7)),
-                iaa.MedianBlur(k=(3, 11)),
-                iaa.MotionBlur(k=(3, 7))
-            ]),
-            OneOf([
-                iaa.AddToHueAndSaturation((-20, 20)),
-                iaa.Grayscale(alpha=(0.0, 0.5)),
-                iaa.ChangeColorTemperature((5000, 10000))
-            ]),
-            SomeOf((0, 2), [
-                iaa.Add((-40, 40)),
-                iaa.Multiply((0.5, 1.5)),
-                iaa.LinearContrast((0.5, 2.0)),
-                iaa.GammaContrast((0.5, 2.0))
-            ]),
-            Sometimes(0.3, iaa.Cutout(nb_iterations=(1, 5), size=0.2, squared=False)),
-            Sometimes(0.3, iaa.CoarseDropout(p=(0.02, 0.1), size_percent=(0.02, 0.05))),
-            # Keep aspect ratio relatively unchanged to maintain hand proportions
-            Sometimes(0.2, iaa.CropAndPad(percent=(-0.15, 0.15), pad_mode="reflect")),
-        ],
-        random_order=True
-    )
+# Custom advanced augmentation functions that don't rely on external libraries
+def apply_random_rotation(image, angle_range=(-25, 25)):
+    """Apply random rotation to an image"""
+    angle = random.uniform(angle_range[0], angle_range[1])
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(image, rotation_matrix, (w, h), borderMode=cv2.BORDER_REPLICATE)
 
-# Apply advanced augmentation to an image
-def apply_advanced_augmentation(image, aug_pipeline):
+def apply_random_brightness_contrast(image, alpha_range=(0.5, 1.5), beta_range=(-30, 30)):
+    """Apply random brightness and contrast to an image"""
+    alpha = random.uniform(alpha_range[0], alpha_range[1])  # Contrast
+    beta = random.uniform(beta_range[0], beta_range[1])    # Brightness
+    return cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
+
+def apply_random_blur(image, max_kernel=7):
+    """Apply random blur to an image"""
+    kernel_size = random.choice([3, 5, 7])
+    if kernel_size > 1:
+        return cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
+    return image
+
+def apply_random_flip(image):
+    """Apply random horizontal flip to an image"""
+    if random.random() > 0.5:
+        return cv2.flip(image, 1)  # 1 means horizontal flip
+    return image
+
+def apply_random_noise(image, var=10):
+    """Apply random noise to an image"""
+    mean = 0
+    sigma = var**0.5
+    gauss = np.random.normal(mean, sigma, image.shape).astype(np.uint8)
+    return cv2.add(image, gauss)
+
+def apply_random_perspective(image, scale=0.05):
+    """Apply random perspective transformation to an image"""
+    h, w = image.shape[:2]
+    
+    # Generate random points shift
+    shift = int(scale * min(h, w))
+    
+    # Get source points (4 corners)
+    src_pts = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    
+    # Get random destination points with small shifts
+    dst_pts = np.float32([
+        [random.randint(0, shift), random.randint(0, shift)],
+        [random.randint(w-shift, w), random.randint(0, shift)],
+        [random.randint(w-shift, w), random.randint(h-shift, h)],
+        [random.randint(0, shift), random.randint(h-shift, h)]
+    ])
+    
+    # Get perspective transform matrix
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    
+    # Apply perspective transformation
+    return cv2.warpPerspective(image, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+def apply_random_cutout(image, num_cutouts=3, max_size=50):
+    """Apply random cutout augmentation to an image"""
+    result = image.copy()
+    h, w = image.shape[:2]
+    
+    for _ in range(num_cutouts):
+        # Random cutout size
+        size_h = random.randint(10, max_size)
+        size_w = random.randint(10, max_size)
+        
+        # Random position
+        x = random.randint(0, w - size_w)
+        y = random.randint(0, h - size_h)
+        
+        # Random color or black
+        if random.random() > 0.5:
+            color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+        else:
+            color = (0, 0, 0)
+        
+        # Apply cutout
+        result[y:y+size_h, x:x+size_w] = color
+    
+    return result
+
+def apply_random_hue_saturation(image, hue_range=(-20, 20), sat_range=(0.5, 1.5), val_range=(0.5, 1.5)):
+    """Apply random changes to hue, saturation, and value"""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+    
+    # Random hue shift
+    hue_shift = random.uniform(hue_range[0], hue_range[1])
+    hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift) % 180
+    
+    # Random saturation and value scaling
+    sat_scale = random.uniform(sat_range[0], sat_range[1])
+    val_scale = random.uniform(val_range[0], val_range[1])
+    
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_scale, 0, 255)
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * val_scale, 0, 255)
+    
+    # Convert back to BGR
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+def apply_advanced_augmentation(image):
+    """Apply multiple random augmentations to an image"""
     # Make sure the image is uint8
     image = np.array(image, dtype=np.uint8)
-    # Apply augmentation
-    image_aug = aug_pipeline(image=image)
-    return image_aug
+    
+    # List of augmentation functions with their probabilities
+    augmentations = [
+        (apply_random_rotation, 0.7),
+        (apply_random_brightness_contrast, 0.7),
+        (apply_random_blur, 0.3),
+        (apply_random_flip, 0.5),
+        (apply_random_noise, 0.3),
+        (apply_random_perspective, 0.3),
+        (apply_random_cutout, 0.3),
+        (apply_random_hue_saturation, 0.5)
+    ]
+    
+    # Apply random augmentations based on their probabilities
+    result = image.copy()
+    for aug_func, prob in augmentations:
+        if random.random() < prob:
+            result = aug_func(result)
+    
+    return result
+
+def apply_mixup(image1, image2, alpha=0.2):
+    """Apply mixup augmentation to two images"""
+    # Generate mixup coefficient
+    lam = np.random.beta(alpha, alpha)
+    lam = max(lam, 1-lam)  # Ensure we don't get too extreme values
+    
+    # Apply mixup
+    mixed = cv2.addWeighted(image1, lam, image2, 1-lam, 0)
+    return mixed
+
+def apply_cutmix(image1, image2):
+    """Apply cutmix augmentation to two images"""
+    # Make a copy of image1
+    result = image1.copy()
+    h, w = image1.shape[:2]
+    
+    # Random patch size
+    patch_h = random.randint(h//4, h//2)
+    patch_w = random.randint(w//4, w//2)
+    
+    # Random patch location
+    x = random.randint(0, w - patch_w)
+    y = random.randint(0, h - patch_h)
+    
+    # Copy patch from image2 to result
+    result[y:y+patch_h, x:x+patch_w] = image2[y:y+patch_h, x:x+patch_w]
+    
+    return result
 
 # Generate diverse synthetic hand images using a mixture of techniques
 def generate_synthetic_hand_images(real_images, target_size=(160, 160), count=100):
@@ -139,57 +244,30 @@ def generate_synthetic_hand_images(real_images, target_size=(160, 160), count=10
     if not real_images:
         return create_basic_hand_shapes(target_size, count)
     
-    # Create augmentation pipeline
-    aug_pipeline = create_augmentation_pipeline()
-    
     # List to store synthetic images
     synthetic_images = []
     
     # Number of images to generate with each technique
+    simple_aug_count = count // 3
     mixup_count = count // 3
-    advanced_aug_count = count // 3
-    cutmix_count = count - mixup_count - advanced_aug_count
+    cutmix_count = count - simple_aug_count - mixup_count
     
-    # 1. Generate images with mixup (linear combination of two images)
-    for _ in range(mixup_count):
-        if len(real_images) < 2:
-            # Not enough images for mixup, use basic augmentation instead
-            img = random.choice(real_images)
-            synthetic_images.append(apply_advanced_augmentation(img, aug_pipeline))
-        else:
-            # Select two random images
-            img1 = random.choice(real_images)
-            img2 = random.choice(real_images)
-            
-            # Resize if needed
-            if img1.shape[:2] != target_size:
-                img1 = cv2.resize(img1, target_size)
-            if img2.shape[:2] != target_size:
-                img2 = cv2.resize(img2, target_size)
-            
-            # Generate random mixing coefficient
-            alpha = random.uniform(0.2, 0.8)
-            
-            # Mix images
-            mixed_img = cv2.addWeighted(img1, alpha, img2, 1-alpha, 0)
-            synthetic_images.append(mixed_img)
-    
-    # 2. Generate images with advanced augmentation
-    for _ in range(advanced_aug_count):
+    # 1. Generate images with simple augmentation
+    for _ in range(simple_aug_count):
         # Select a random image
         img = random.choice(real_images)
         
+        # Resize if needed
+        if img.shape[:2] != target_size:
+            img = cv2.resize(img, target_size)
+        
         # Apply advanced augmentation
-        aug_img = apply_advanced_augmentation(img, aug_pipeline)
+        aug_img = apply_advanced_augmentation(img)
         synthetic_images.append(aug_img)
     
-    # 3. Generate images with cutmix (patch from one image into another)
-    for _ in range(cutmix_count):
-        if len(real_images) < 2:
-            # Not enough images for cutmix, use basic augmentation instead
-            img = random.choice(real_images)
-            synthetic_images.append(apply_advanced_augmentation(img, aug_pipeline))
-        else:
+    # 2. Generate images with mixup
+    if len(real_images) >= 2:
+        for _ in range(mixup_count):
             # Select two random images
             img1 = random.choice(real_images)
             img2 = random.choice(real_images)
@@ -200,22 +278,42 @@ def generate_synthetic_hand_images(real_images, target_size=(160, 160), count=10
             if img2.shape[:2] != target_size:
                 img2 = cv2.resize(img2, target_size)
             
-            # Create base image
-            result_img = img1.copy()
+            # Apply mixup
+            mixed_img = apply_mixup(img1, img2)
+            synthetic_images.append(mixed_img)
+    else:
+        # Not enough images for mixup, use simple augmentation instead
+        for _ in range(mixup_count):
+            img = random.choice(real_images)
+            if img.shape[:2] != target_size:
+                img = cv2.resize(img, target_size)
+            aug_img = apply_advanced_augmentation(img)
+            synthetic_images.append(aug_img)
+    
+    # 3. Generate images with cutmix
+    if len(real_images) >= 2:
+        for _ in range(cutmix_count):
+            # Select two random images
+            img1 = random.choice(real_images)
+            img2 = random.choice(real_images)
             
-            # Define a random patch
-            h, w = target_size
-            patch_size_h = random.randint(h//4, h//2)
-            patch_size_w = random.randint(w//4, w//2)
+            # Resize if needed
+            if img1.shape[:2] != target_size:
+                img1 = cv2.resize(img1, target_size)
+            if img2.shape[:2] != target_size:
+                img2 = cv2.resize(img2, target_size)
             
-            # Random patch location
-            x1 = random.randint(0, w - patch_size_w)
-            y1 = random.randint(0, h - patch_size_h)
-            
-            # Copy patch from img2 to result_img
-            result_img[y1:y1+patch_size_h, x1:x1+patch_size_w] = img2[y1:y1+patch_size_h, x1:x1+patch_size_w]
-            
-            synthetic_images.append(result_img)
+            # Apply cutmix
+            cutmix_img = apply_cutmix(img1, img2)
+            synthetic_images.append(cutmix_img)
+    else:
+        # Not enough images for cutmix, use simple augmentation instead
+        for _ in range(cutmix_count):
+            img = random.choice(real_images)
+            if img.shape[:2] != target_size:
+                img = cv2.resize(img, target_size)
+            aug_img = apply_advanced_augmentation(img)
+            synthetic_images.append(aug_img)
     
     return synthetic_images
 
@@ -246,9 +344,6 @@ def create_basic_hand_shapes(target_size=(160, 160), count=100):
         (120, 80, 60),    # Medium dark
         (80, 50, 30)      # Dark
     ]
-    
-    # Create augmentation pipeline for diversity
-    aug_pipeline = create_augmentation_pipeline()
     
     for _ in range(count):
         # Create a background
@@ -285,7 +380,7 @@ def create_basic_hand_shapes(target_size=(160, 160), count=100):
             cv2.circle(image, point, thickness // 2 + 2, skin_tone, -1)
         
         # Apply advanced augmentation for more diversity
-        augmented_image = apply_advanced_augmentation(image, aug_pipeline)
+        augmented_image = apply_advanced_augmentation(image)
         hand_shapes.append(augmented_image)
     
     return hand_shapes
@@ -364,18 +459,9 @@ def process_class_folder(class_folder, path, target_size=(160, 160), augment=Fal
     
     return class_data, class_labels, class_paths
 
-# Generate mixup samples for training (linearly combines pairs of samples and labels)
-def mixup(x_batch, y_batch, alpha=0.2):
-    """Apply mixup to a batch of samples.
-    
-    Args:
-        x_batch: Input batch of images
-        y_batch: Input batch of labels (one-hot encoded)
-        alpha: Parameter for beta distribution
-        
-    Returns:
-        Mixup batch of images and labels
-    """
+# Mixup batch data (on-the-fly during training)
+def mixup_batch(x_batch, y_batch, alpha=0.2):
+    """Apply mixup to a batch of samples"""
     batch_size = len(x_batch)
     indices = np.random.permutation(batch_size)
     x1, x2 = x_batch, x_batch[indices]
@@ -383,7 +469,7 @@ def mixup(x_batch, y_batch, alpha=0.2):
     
     # Sample lambda from beta distribution
     lam = np.random.beta(alpha, alpha, batch_size)
-    lam = np.max([lam, 1-lam], axis=0)
+    lam = np.maximum(lam, 1-lam)
     lam = np.reshape(lam, (batch_size, 1, 1, 1))
     
     # Create mixed images
@@ -410,12 +496,6 @@ class AdvancedGestureDataGenerator(Sequence):
         self.indexes = np.arange(len(self.images))
         if self.shuffle:
             np.random.shuffle(self.indexes)
-        
-        # Create augmentation pipeline
-        self.aug_pipeline = iaa.Sequential([
-            iaa.Sometimes(0.3, iaa.Cutout(nb_iterations=(1, 5), size=0.2, squared=False)),
-            iaa.Sometimes(0.2, iaa.CoarseDropout(p=(0.02, 0.1), size_percent=(0.02, 0.05))),
-        ])
     
     def __len__(self):
         return int(np.ceil(len(self.images) / self.batch_size))
@@ -436,11 +516,13 @@ class AdvancedGestureDataGenerator(Sequence):
         if self.augment:
             # Apply cutout with certain probability
             if np.random.random() < self.cutout_prob:
-                batch_images = self.aug_pipeline(images=batch_images)
+                # Apply cutout to each image in batch
+                for i in range(len(batch_images)):
+                    batch_images[i] = apply_random_cutout(batch_images[i])
             
             # Apply mixup with certain probability
             if np.random.random() < 0.3:
-                batch_images, batch_labels = mixup(batch_images, batch_labels, self.mixup_alpha)
+                batch_images, batch_labels = mixup_batch(batch_images, batch_labels, self.mixup_alpha)
         
         # Normalize images
         batch_images = batch_images / 255.0
@@ -571,72 +653,112 @@ def inference(image_path, model, label_encoder, target_size=(160, 160)):
             'top_predictions': top_predictions
         }
 
-# Function to visualize generated samples
-def visualize_augmentations(original_images, target_size=(160, 160), samples_per_image=5):
+# Function to visualize augmentation examples
+def visualize_augmentations(original_images, target_size=(160, 160)):
     """Generate and visualize different augmentation techniques"""
-    if not original_images:
+    if not original_images or len(original_images) == 0:
         return
     
     # Select a random original image
-    original_image = random.choice(original_images)
-    original_image = cv2.resize(original_image, target_size)
+    original = random.choice(original_images)
+    original = cv2.resize(original, target_size)
     
-    # Create augmentation pipeline
-    aug_pipeline = create_augmentation_pipeline()
-    
-    # Create a visualization grid
-    rows = 3  # Original + mixup + augmentation
-    cols = samples_per_image
-    plt.figure(figsize=(15, 9))
+    # Create output grid
+    plt.figure(figsize=(15, 15))
     
     # Show original image
-    plt.subplot(rows, cols, 1)
-    plt.imshow(cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB))
+    plt.subplot(4, 4, 1)
+    plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
     plt.title("Original")
     plt.axis("off")
     
-    # Show augmented versions
-    for i in range(1, cols):
-        plt.subplot(rows, cols, i+1)
-        augmented = apply_advanced_augmentation(original_image, aug_pipeline)
-        plt.imshow(cv2.cvtColor(augmented, cv2.COLOR_BGR2RGB))
-        plt.title(f"Aug {i}")
+    # Show rotation
+    plt.subplot(4, 4, 2)
+    rotated = apply_random_rotation(original)
+    plt.imshow(cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB))
+    plt.title("Rotation")
+    plt.axis("off")
+    
+    # Show brightness/contrast
+    plt.subplot(4, 4, 3)
+    bc_adjusted = apply_random_brightness_contrast(original)
+    plt.imshow(cv2.cvtColor(bc_adjusted, cv2.COLOR_BGR2RGB))
+    plt.title("Brightness/Contrast")
+    plt.axis("off")
+    
+    # Show blur
+    plt.subplot(4, 4, 4)
+    blurred = apply_random_blur(original)
+    plt.imshow(cv2.cvtColor(blurred, cv2.COLOR_BGR2RGB))
+    plt.title("Blur")
+    plt.axis("off")
+    
+    # Show flip
+    plt.subplot(4, 4, 5)
+    flipped = apply_random_flip(original)
+    plt.imshow(cv2.cvtColor(flipped, cv2.COLOR_BGR2RGB))
+    plt.title("Flip")
+    plt.axis("off")
+    
+    # Show noise
+    plt.subplot(4, 4, 6)
+    noisy = apply_random_noise(original)
+    plt.imshow(cv2.cvtColor(noisy, cv2.COLOR_BGR2RGB))
+    plt.title("Noise")
+    plt.axis("off")
+    
+    # Show perspective
+    plt.subplot(4, 4, 7)
+    perspective = apply_random_perspective(original)
+    plt.imshow(cv2.cvtColor(perspective, cv2.COLOR_BGR2RGB))
+    plt.title("Perspective")
+    plt.axis("off")
+    
+    # Show cutout
+    plt.subplot(4, 4, 8)
+    cutout = apply_random_cutout(original)
+    plt.imshow(cv2.cvtColor(cutout, cv2.COLOR_BGR2RGB))
+    plt.title("Cutout")
+    plt.axis("off")
+    
+    # Show HSV adjustment
+    plt.subplot(4, 4, 9)
+    hsv_adjusted = apply_random_hue_saturation(original)
+    plt.imshow(cv2.cvtColor(hsv_adjusted, cv2.COLOR_BGR2RGB))
+    plt.title("HSV Adjustment")
+    plt.axis("off")
+    
+    # Show combined augmentation
+    plt.subplot(4, 4, 10)
+    combined = apply_advanced_augmentation(original)
+    plt.imshow(cv2.cvtColor(combined, cv2.COLOR_BGR2RGB))
+    plt.title("Combined")
+    plt.axis("off")
+    
+    # Show mixup if we have multiple images
+    if len(original_images) >= 2:
+        plt.subplot(4, 4, 11)
+        second_image = random.choice([img for img in original_images if not np.array_equal(img, original)])
+        second_image = cv2.resize(second_image, target_size)
+        mixup_image = apply_mixup(original, second_image)
+        plt.imshow(cv2.cvtColor(mixup_image, cv2.COLOR_BGR2RGB))
+        plt.title("Mixup")
+        plt.axis("off")
+        
+        # Show cutmix
+        plt.subplot(4, 4, 12)
+        cutmix_image = apply_cutmix(original, second_image)
+        plt.imshow(cv2.cvtColor(cutmix_image, cv2.COLOR_BGR2RGB))
+        plt.title("CutMix")
         plt.axis("off")
     
-    # Show mixup versions (if we have at least 2 images)
-    if len(original_images) >= 2:
-        for i in range(cols):
-            plt.subplot(rows, cols, cols+i+1)
-            # Get another random image
-            second_image = random.choice([img for img in original_images if not np.array_equal(img, original_image)])
-            second_image = cv2.resize(second_image, target_size)
-            # Apply mixup
-            alpha = random.uniform(0.2, 0.8)
-            mixed = cv2.addWeighted(original_image, alpha, second_image, 1-alpha, 0)
-            plt.imshow(cv2.cvtColor(mixed, cv2.COLOR_BGR2RGB))
-            plt.title(f"Mixup α={alpha:.2f}")
-            plt.axis("off")
-    
-    # Show cutmix versions (if we have at least 2 images)
-    if len(original_images) >= 2:
-        for i in range(cols):
-            plt.subplot(rows, cols, 2*cols+i+1)
-            # Get another random image
-            second_image = random.choice([img for img in original_images if not np.array_equal(img, original_image)])
-            second_image = cv2.resize(second_image, target_size)
-            
-            # Create cutmix image
-            result_img = original_image.copy()
-            h, w = target_size
-            patch_size_h = random.randint(h//4, h//2)
-            patch_size_w = random.randint(w//4, w//2)
-            x1 = random.randint(0, w - patch_size_w)
-            y1 = random.randint(0, h - patch_size_h)
-            result_img[y1:y1+patch_size_h, x1:x1+patch_size_w] = second_image[y1:y1+patch_size_h, x1:x1+patch_size_w]
-            
-            plt.imshow(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
-            plt.title(f"CutMix")
-            plt.axis("off")
+    # Show a few more combined examples
+    for i in range(4):
+        plt.subplot(4, 4, 13+i)
+        advanced = apply_advanced_augmentation(original)
+        plt.imshow(cv2.cvtColor(advanced, cv2.COLOR_BGR2RGB))
+        plt.title(f"Advanced {i+1}")
+        plt.axis("off")
     
     plt.tight_layout()
     plt.savefig(os.path.join(MODEL_PATH, 'augmentation_examples.png'))
@@ -664,15 +786,29 @@ if __name__ == "__main__":
     y_train = []
     train_paths = []
     
+    # Create sample visualization directory
+    vis_dir = os.path.join(MODEL_PATH, 'augmentation_samples')
+    os.makedirs(vis_dir, exist_ok=True)
+    
     print("Processing training data...")
     for class_folder in tqdm(train_class_folders):
         class_data, class_labels, class_paths = process_class_folder(
             class_folder, TRAIN_PATH, TARGET_SIZE, augment=True, min_samples=AUGMENT_MIN
         )
         
-        # Visualize augmentations for each class (limit to first 5 classes)
-        if len(X_train) < 5 * AUGMENT_MIN and class_data:
+        # Visualize augmentations for first few classes
+        if len(X_train) < 1000 and class_data:
             visualize_augmentations(class_data, TARGET_SIZE)
+            
+            # Save some sample augmented images
+            if not os.path.exists(os.path.join(vis_dir, class_folder)):
+                os.makedirs(os.path.join(vis_dir, class_folder), exist_ok=True)
+            
+            # Save up to 5 random samples
+            for i in range(min(5, len(class_data))):
+                sample_idx = random.randint(0, len(class_data)-1)
+                sample_path = os.path.join(vis_dir, class_folder, f"sample_{i}.jpg")
+                cv2.imwrite(sample_path, class_data[sample_idx])
         
         X_train.extend(class_data)
         y_train.extend(class_labels)
@@ -773,7 +909,7 @@ if __name__ == "__main__":
     callbacks = [
         EarlyStopping(patience=7, restore_best_weights=True),  # Increased patience
         ReduceLROnPlateau(factor=0.1, patience=5, min_lr=1e-6),  # Increased patience, more aggressive reduction
-        ModelCheckpoint(os.path.join(MODEL_PATH, 'best_model.h5'), save_best_weights_only=True)
+        ModelCheckpoint(os.path.join(MODEL_PATH, 'best_model.h5'), save_best_only=True)
     ]
     
     # Train model
