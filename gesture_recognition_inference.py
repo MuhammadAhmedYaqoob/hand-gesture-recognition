@@ -35,7 +35,7 @@ class GestureRecognizer:
         )
         
         # Image parameters
-        self.target_size = (224, 224)
+        self.target_size = (160, 160)
     
     def extract_landmarks(self, image):
         """
@@ -252,14 +252,14 @@ class GestureRecognizer:
 # Example usage
 if __name__ == "__main__":
     # Define paths to model and label encoder
-    model_path = os.path.join("model", "final_model.h5")
-    label_encoder_path = os.path.join("model", "label_encoder.pkl")
+    model_path = os.path.join("Active Learning Multi-label Classification.v1i.folder\model", "final_model.h5")
+    label_encoder_path = os.path.join("Active Learning Multi-label Classification.v1i.folder\model", "label_encoder.pkl")
     
     # Initialize the gesture recognizer
     recognizer = GestureRecognizer(model_path, label_encoder_path)
     
     # Option 1: Predict from a single image file
-    image_path = "path/to/test/image.jpg"
+    image_path = "test.jpg"
     result = recognizer.predict_from_path(image_path)
     
     if result['success']:
